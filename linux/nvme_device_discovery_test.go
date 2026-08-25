@@ -7,6 +7,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/hpe-storage/common-host-libs/model"
 )
 
 // fakeFileInfo is a minimal os.FileInfo whose only meaningful field is Name(),
@@ -92,5 +94,181 @@ func TestGetNvmeDeviceFromNamespace_NotFound(t *testing.T) {
 	}
 	if dev != nil {
 		t.Fatalf("expected nil device, got %+v", dev)
+	}
+}
+
+func setNvmeOptimizationTestSeams(t *testing.T) {
+	t.Helper()
+	origReadDir := nvmeControllerReadDir
+	origReadFirstLine := nvmeControllerReadFirstLine
+	origExec := nvmeExecCommandOutput
+	origFindDevices := nvmeFindDevices
+	origApplyTuning := nvmeApplyTcpTuning
+	t.Cleanup(func() {
+		nvmeControllerReadDir = origReadDir
+		nvmeControllerReadFirstLine = origReadFirstLine
+		nvmeExecCommandOutput = origExec
+		nvmeFindDevices = origFindDevices
+		nvmeApplyTcpTuning = origApplyTuning
+	})
+}
+
+func TestGetLiveNvmeControllersForNQN(t *testing.T) {
+	setNvmeOptimizationTestSeams(t)
+	nvmeControllerReadDir = func(string) ([]os.FileInfo, error) {
+		return []os.FileInfo{
+			fakeFileInfo{name: "nvme0"},
+			fakeFileInfo{name: "nvme1"},
+			fakeFileInfo{name: "nvme2"},
+		}, nil
+	}
+	nvmeControllerReadFirstLine = func(path string) (string, error) {
+		values := map[string]string{
+			"/sys/class/nvme/nvme0/subsysnqn": "nqn.target",
+			"/sys/class/nvme/nvme0/state":     "live",
+			"/sys/class/nvme/nvme0/address":   "traddr=10.0.0.1,trsvcid=4420",
+			"/sys/class/nvme/nvme1/subsysnqn": "nqn.target",
+			"/sys/class/nvme/nvme1/state":     "connecting",
+			"/sys/class/nvme/nvme1/address":   "traddr=10.0.0.2,trsvcid=4420",
+			"/sys/class/nvme/nvme2/subsysnqn": "nqn.other",
+		}
+		value, ok := values[path]
+		if !ok {
+			return "", fmt.Errorf("unexpected path %s", path)
+		}
+		return value, nil
+	}
+
+	addrs, err := getLiveNvmeControllersForNQN("nqn.target")
+	if err != nil {
+		t.Fatalf("getLiveNvmeControllersForNQN() error = %v", err)
+	}
+	if len(addrs) != 1 || !addrs["10.0.0.1"] {
+		t.Fatalf("live addresses = %v, want only 10.0.0.1", addrs)
+	}
+}
+
+func TestGetLiveNvmeControllersForNQNReadDirError(t *testing.T) {
+	setNvmeOptimizationTestSeams(t)
+	nvmeControllerReadDir = func(string) ([]os.FileInfo, error) {
+		return nil, fmt.Errorf("sysfs unavailable")
+	}
+
+	addrs, err := getLiveNvmeControllersForNQN("nqn.target")
+	if err == nil {
+		t.Fatal("getLiveNvmeControllersForNQN() error = nil, want error")
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("live addresses = %v, want empty", addrs)
+	}
+}
+
+func TestAllTargetPortalsLive(t *testing.T) {
+	volume := &model.Volume{TargetAddress: " 10.0.0.1,10.0.0.2 "}
+	if !allTargetPortalsLive(volume, map[string]bool{"10.0.0.1": true, "10.0.0.2": true}) {
+		t.Fatal("allTargetPortalsLive() = false, want true")
+	}
+	if allTargetPortalsLive(volume, map[string]bool{"10.0.0.1": true}) {
+		t.Fatal("allTargetPortalsLive() = true with missing portal, want false")
+	}
+}
+
+// TestConnectNvmeTargetConnectsAllPortalsWhenNoneLive passes an empty liveAddrs,
+// so ConnectNvmeTarget must attempt every portal. Deterministic on any host,
+// real NVMe or none, since liveAddrs is now supplied by the caller rather than
+// scanned from /sys/class/nvme internally.
+func TestConnectNvmeTargetConnectsAllPortalsWhenNoneLive(t *testing.T) {
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	var connectedAddresses []string
+	nvmeExecCommandOutput = func(_ string, args []string) (string, int, error) {
+		connectedAddresses = append(connectedAddresses, args[6])
+		return "", 0, nil
+	}
+
+	err := ConnectNvmeTarget(&model.NvmeTarget{
+		NQN:     "nqn.test-only.no-such-subsystem",
+		Address: "10.0.0.1,10.0.0.2",
+		Port:    "4420",
+	}, nil)
+	if err != nil {
+		t.Fatalf("ConnectNvmeTarget() error = %v", err)
+	}
+	if fmt.Sprint(connectedAddresses) != "[10.0.0.1 10.0.0.2]" {
+		t.Fatalf("connected addresses = %v, want both portals attempted", connectedAddresses)
+	}
+}
+
+// TestConnectNvmeTargetSkipsConnectWhenAllPortalsLive verifies that, given a
+// liveAddrs set already covering every portal, ConnectNvmeTarget returns
+// success without executing a single "nvme connect".
+func TestConnectNvmeTargetSkipsConnectWhenAllPortalsLive(t *testing.T) {
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	execCount := 0
+	nvmeExecCommandOutput = func(_ string, _ []string) (string, int, error) {
+		execCount++
+		return "", 0, nil
+	}
+
+	err := ConnectNvmeTarget(&model.NvmeTarget{
+		NQN:     "nqn.test-only.all-live",
+		Address: "10.0.0.1,10.0.0.2",
+		Port:    "4420",
+	}, map[string]bool{"10.0.0.1": true, "10.0.0.2": true})
+	if err != nil {
+		t.Fatalf("ConnectNvmeTarget() error = %v, want success when all portals already live", err)
+	}
+	if execCount != 0 {
+		t.Fatalf("nvme connect exec count = %d, want 0 when all portals already live", execCount)
+	}
+}
+
+// TestConnectNvmeTargetRejectsEmptyAddress ensures an empty/blank target
+// address fails fast with a clear error instead of attempting "nvme connect"
+// with a blank -a argument.
+func TestConnectNvmeTargetRejectsEmptyAddress(t *testing.T) {
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	execCount := 0
+	nvmeExecCommandOutput = func(_ string, _ []string) (string, int, error) {
+		execCount++
+		return "", 0, nil
+	}
+
+	err := ConnectNvmeTarget(&model.NvmeTarget{NQN: "nqn.test-only.empty-address", Address: "  ", Port: "4420"}, nil)
+	if err == nil {
+		t.Fatal("ConnectNvmeTarget() error = nil, want error for empty target address")
+	}
+	if execCount != 0 {
+		t.Fatalf("nvme connect exec count = %d, want 0 for empty target address", execCount)
+	}
+}
+
+// TestConnectNvmeTargetDedupesPortals ensures a repeated IP in target.Address
+// (e.g. a trailing comma or literal duplicate) is only attempted once.
+func TestConnectNvmeTargetDedupesPortals(t *testing.T) {
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	var attempted []string
+	nvmeExecCommandOutput = func(_ string, args []string) (string, int, error) {
+		attempted = append(attempted, args[6])
+		return "", 0, nil
+	}
+
+	err := ConnectNvmeTarget(&model.NvmeTarget{NQN: "nqn.test-only.dup", Address: "10.0.0.1,10.0.0.1,", Port: "4420"}, nil)
+	if err != nil {
+		t.Fatalf("ConnectNvmeTarget() error = %v", err)
+	}
+	if fmt.Sprint(attempted) != "[10.0.0.1]" {
+		t.Fatalf("attempted portals = %v, want a single deduped 10.0.0.1", attempted)
+	}
+}
+
+// TestHandleNvmeTcpDiscoveryNilVolume ensures a nil volume returns an error
+// instead of panicking.
+func TestHandleNvmeTcpDiscoveryNilVolume(t *testing.T) {
+	if err := HandleNvmeTcpDiscovery(nil); err == nil {
+		t.Fatal("HandleNvmeTcpDiscovery(nil) error = nil, want error")
 	}
 }
