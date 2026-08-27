@@ -265,6 +265,96 @@ func TestConnectNvmeTargetDedupesPortals(t *testing.T) {
 	}
 }
 
+// TestConnectNvmeTargetPassesCtrlLossTmo asserts that every "nvme connect"
+// carries the default "-l 1800" so a lost I/O controller keeps retrying and
+// self-reattaches after an array outage longer than the 600s kernel default (CON-4387).
+func TestConnectNvmeTargetPassesCtrlLossTmo(t *testing.T) {
+	t.Setenv(envNvmeCtrlLossTmo, "")
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	var capturedArgs []string
+	nvmeExecCommandOutput = func(_ string, args []string) (string, int, error) {
+		capturedArgs = args
+		return "", 0, nil
+	}
+
+	err := ConnectNvmeTarget(&model.NvmeTarget{NQN: "nqn.test-only.ctrl-loss", Address: "10.0.0.1", Port: "4420"}, nil)
+	if err != nil {
+		t.Fatalf("ConnectNvmeTarget() error = %v", err)
+	}
+
+	found := false
+	for i, a := range capturedArgs {
+		if a == "-l" {
+			if i+1 >= len(capturedArgs) || capturedArgs[i+1] != defaultNvmeCtrlLossTmo {
+				t.Fatalf("connect args = %v, want -l followed by %s", capturedArgs, defaultNvmeCtrlLossTmo)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("connect args = %v, want an explicit -l (ctrl-loss-tmo)", capturedArgs)
+	}
+}
+
+// TestConnectNvmeTargetHonorsCtrlLossTmoEnv asserts NVME_CTRL_LOSS_TMO overrides
+// the -l value passed to "nvme connect".
+func TestConnectNvmeTargetHonorsCtrlLossTmoEnv(t *testing.T) {
+	t.Setenv(envNvmeCtrlLossTmo, "1800")
+	originalExec := nvmeExecCommandOutput
+	t.Cleanup(func() { nvmeExecCommandOutput = originalExec })
+	var capturedArgs []string
+	nvmeExecCommandOutput = func(_ string, args []string) (string, int, error) {
+		capturedArgs = args
+		return "", 0, nil
+	}
+
+	if err := ConnectNvmeTarget(&model.NvmeTarget{NQN: "nqn.test-only.env", Address: "10.0.0.1", Port: "4420"}, nil); err != nil {
+		t.Fatalf("ConnectNvmeTarget() error = %v", err)
+	}
+	for i, a := range capturedArgs {
+		if a == "-l" {
+			if i+1 >= len(capturedArgs) || capturedArgs[i+1] != "1800" {
+				t.Fatalf("connect args = %v, want -l followed by 1800", capturedArgs)
+			}
+			return
+		}
+	}
+	t.Fatalf("connect args = %v, want an explicit -l (ctrl-loss-tmo)", capturedArgs)
+}
+
+// TestGetNvmeCtrlLossTmo covers the env override, the default fallback, and the
+// invalid-value fallback for NVME_CTRL_LOSS_TMO.
+func TestGetNvmeCtrlLossTmo(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		set  bool
+		want string
+	}{
+		{"unset uses default", "", false, defaultNvmeCtrlLossTmo},
+		{"empty uses default", "", true, defaultNvmeCtrlLossTmo},
+		{"valid seconds", "1800", true, "1800"},
+		{"valid infinite", "-1", true, "-1"},
+		{"valid zero", "0", true, "0"},
+		{"non-integer falls back", "abc", true, defaultNvmeCtrlLossTmo},
+		{"below range falls back", "-2", true, defaultNvmeCtrlLossTmo},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(envNvmeCtrlLossTmo, tc.env)
+			} else {
+				t.Setenv(envNvmeCtrlLossTmo, "")
+			}
+			if got := getNvmeCtrlLossTmo(); got != tc.want {
+				t.Fatalf("getNvmeCtrlLossTmo() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestHandleNvmeTcpDiscoveryNilVolume ensures a nil volume returns an error
 // instead of panicking.
 func TestHandleNvmeTcpDiscoveryNilVolume(t *testing.T) {
